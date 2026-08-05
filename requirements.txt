@@ -1,0 +1,10 @@
+gradio>=4.0.0,<5.0.0
+google-generativeai
+groq
+chromadb
+sentence-transformers
+unstructured[pdf]
+antlr4-python3-runtime==4.9.2
+PyMuPDF
+langchain
+python-dotenv

@@ -1,0 +1,10 @@
+.env
+data/
+__pycache__/
+
+# Internal planning/reference docs — not part of the deployed app
+PLAN.md
+CLAUDE.md
+claude.md
+GT_RAG_PRD.md
+.claude/
