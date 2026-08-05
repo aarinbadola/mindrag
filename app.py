@@ -1,9 +1,19 @@
 import time
 
 import gradio as gr
+import spaces
 
 import database
 import pipeline
+
+
+@spaces.GPU
+def _zerogpu_startup_probe():
+    """Never called — ZeroGPU (the free-tier Gradio Space hardware) requires at
+    least one @spaces.GPU function to exist at startup, even though this app
+    is intentionally CPU-only (see CLAUDE.md)."""
+    pass
+
 
 pipeline.startup()
 
