@@ -49,8 +49,11 @@ def _extract_retry_after(exc: RateLimitError) -> int:
         return max(1, int(float(match.group(1))) + 1)
     return 30
 
-embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
-reranker_model = CrossEncoder(config.RERANKER_MODEL)
+# device="cpu" is forced, not inferred: on ZeroGPU a GPU is visible at startup
+# but not reliably usable outside an @spaces.GPU-wrapped call, so letting these
+# auto-detect cuda silently corrupts every embedding/rerank at query time.
+embedding_model = SentenceTransformer(config.EMBEDDING_MODEL, device="cpu")
+reranker_model = CrossEncoder(config.RERANKER_MODEL, device="cpu")
 
 _text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=config.CHUNK_SIZE,
