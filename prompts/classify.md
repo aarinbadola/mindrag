@@ -17,7 +17,10 @@ DISAMBIGUATION RULES:
 - "summarize our chat" or "summarize our conversation" → "recap"
 - "what did we discuss" or "what have we talked about" → "recap"
 - "summarize the document" or "give me an overview of the PDF" → "summarization"
-- "what is X" or any factual question → "qa"
+- "what is in/there in this document" or "what does this document/PDF contain"
+  or "what's this document about" → "summarization" (asking about a whole
+  document's contents is a summary request, even when phrased as "what is")
+- "what is X" asking about a specific fact, term, or concept → "qa"
 - When unsure between qa and summarization → choose "qa"
 - When unsure between recap and summarization → choose "recap"
 

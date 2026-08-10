@@ -94,6 +94,7 @@ def _call_groq_json(system_prompt: str, user_content: str):
     try:
         response = groq_client.chat.completions.create(
             model=config.GROQ_MODEL,
+            temperature=0,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -119,6 +120,24 @@ def _call_groq_text(system_prompt: str, user_content: str) -> str:
         return response.choices[0].message.content.strip()
     except RateLimitError as exc:
         raise RateLimitedError(_extract_retry_after(exc)) from exc
+
+
+def _call_groq_text_resilient(system_prompt: str, user_content: str, max_retries: int = 3) -> str:
+    """Same as _call_groq_text, but waits out Groq's reported cooldown and retries
+    instead of aborting immediately — map-reduce summarization makes several
+    sequential calls for one document and is far more likely to hit the
+    per-minute token limit mid-run than a single QA call is."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return _call_groq_text(system_prompt, user_content)
+        except RateLimitedError as exc:
+            if attempt == max_retries:
+                raise
+            logger.warning(
+                "Rate limited during summarization — waiting %ss (attempt %d/%d)",
+                exc.retry_after, attempt, max_retries,
+            )
+            time.sleep(exc.retry_after)
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +618,7 @@ def _summarize_chunks(chunks: list[dict]) -> str:
     for batch in batches:
         batch_text = "\n\n".join(c["text"] for c in batch)
         try:
-            partial_summaries.append(_call_groq_text(SUMMARIZE_PROMPT, batch_text))
+            partial_summaries.append(_call_groq_text_resilient(SUMMARIZE_PROMPT, batch_text))
         except RateLimitedError:
             raise
         except Exception as exc:
@@ -613,7 +632,7 @@ def _summarize_chunks(chunks: list[dict]) -> str:
 
     combined_input = "\n\n".join(f"Partial summary {i + 1}:\n{s}" for i, s in enumerate(partial_summaries))
     try:
-        return _call_groq_text(
+        return _call_groq_text_resilient(
             SUMMARIZE_PROMPT, f"Combine these partial summaries into one cohesive summary:\n\n{combined_input}"
         )
     except RateLimitedError:
@@ -652,7 +671,7 @@ def handle_summarization(final_query: str, session_id: str) -> dict:
 
     combined_text = "\n\n".join(doc_summaries)
     try:
-        overview = _call_groq_text(
+        overview = _call_groq_text_resilient(
             SUMMARIZE_PROMPT, f"Combine these per-document summaries into one overview:\n\n{combined_text}"
         )
     except RateLimitedError:
