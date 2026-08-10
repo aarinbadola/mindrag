@@ -561,7 +561,14 @@ def handle_qa(final_query: str, session_id: str) -> dict:
         key = (c["document_name"], c["page"])
         if key not in seen:
             seen.add(key)
-            sources.append({"document": c["document_name"], "page": c["page"]})
+            sources.append(
+                {
+                    "document": c["document_name"],
+                    "page": c["page"],
+                    "confidence": round(c["confidence"], 4),
+                    "reranker_score": round(c["reranker_score"], 4),
+                }
+            )
 
     return {"answer": answer, "sources": sources, "chunks_used": len(selected)}
 

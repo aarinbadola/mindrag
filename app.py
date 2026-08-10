@@ -65,11 +65,13 @@ def _format_sources_display(sources):
         return ""
     parts = []
     for s in sources:
-        if s.get("page") is not None:
-            parts.append(f"{s['document']} (p.{s['page']})")
-        else:
-            parts.append(s["document"])
-    return ", ".join(parts)
+        label = f"{s['document']} (p.{s['page']})" if s.get("page") is not None else s["document"]
+        confidence = s.get("confidence")
+        reranker_score = s.get("reranker_score")
+        if confidence is not None and reranker_score is not None:
+            label += f" [conf {confidence:.2f}, rerank {reranker_score:.2f}]"
+        parts.append(label)
+    return "\n".join(parts)
 
 
 def _messages_to_chatbot_history(messages):
@@ -320,7 +322,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             with gr.Accordion("Last Response Metrics", open=False):
                 latency_box = gr.Textbox(label="Latency", interactive=False)
                 chunks_box = gr.Textbox(label="Chunks Used", interactive=False)
-                sources_box = gr.Textbox(label="Sources", interactive=False)
+                sources_box = gr.Textbox(label="Sources", interactive=False, lines=4)
 
             clear_btn = gr.Button("Clear Conversation")
 
