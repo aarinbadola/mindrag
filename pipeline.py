@@ -555,20 +555,15 @@ def handle_qa(final_query: str, session_id: str) -> dict:
         logger.error("Groq call failed: %s", exc)
         answer = "I encountered an error processing your request. Please try again."
 
-    sources = []
-    seen = set()
-    for c in selected:
-        key = (c["document_name"], c["page"])
-        if key not in seen:
-            seen.add(key)
-            sources.append(
-                {
-                    "document": c["document_name"],
-                    "page": c["page"],
-                    "confidence": round(c["confidence"], 4),
-                    "reranker_score": round(c["reranker_score"], 4),
-                }
-            )
+    sources = [
+        {
+            "document": c["document_name"],
+            "page": c["page"],
+            "confidence": round(c["confidence"], 4),
+            "reranker_score": round(c["reranker_score"], 4),
+        }
+        for c in selected
+    ]
 
     return {"answer": answer, "sources": sources, "chunks_used": len(selected)}
 
