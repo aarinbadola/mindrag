@@ -28,10 +28,14 @@ def init_db():
                 filename     TEXT UNIQUE NOT NULL,
                 ingested_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 chunk_count  INTEGER DEFAULT 0,
-                status       TEXT DEFAULT 'ready'
+                status       TEXT DEFAULT 'ready',
+                summary      TEXT
             )
             """
         )
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+        if "summary" not in existing_columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN summary TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -63,6 +67,22 @@ def register_document(filename, chunk_count, status="ready"):
             """,
             (filename, chunk_count, status),
         )
+
+
+def update_document_summary(filename, summary):
+    with _get_connection() as conn:
+        conn.execute(
+            "UPDATE documents SET summary = ? WHERE filename = ?",
+            (summary, filename),
+        )
+
+
+def get_document_summary(filename):
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT summary FROM documents WHERE filename = ?", (filename,)
+        ).fetchone()
+        return row["summary"] if row else None
 
 
 def get_registered_documents():
@@ -159,7 +179,7 @@ def get_last_assistant_message(session_id):
     with _get_connection() as conn:
         row = conn.execute(
             """
-            SELECT content, latency_ms, chunks_used, sources
+            SELECT content, intent, latency_ms, chunks_used, sources
             FROM messages
             WHERE session_id = ? AND role = 'assistant'
             ORDER BY created_at DESC
@@ -171,6 +191,7 @@ def get_last_assistant_message(session_id):
             return None
         return {
             "content": row["content"],
+            "intent": row["intent"],
             "latency_ms": row["latency_ms"],
             "chunks_used": row["chunks_used"],
             "sources": json.loads(row["sources"]) if row["sources"] else [],

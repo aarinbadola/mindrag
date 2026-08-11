@@ -24,6 +24,13 @@ MAX_DOCUMENTS = 10
 MIN_IMAGE_WIDTH = 100
 MIN_IMAGE_HEIGHT = 100
 
+# Document resolution for summarization intent — embedding cosine similarity
+# against registered document titles.
+DOC_RESOLUTION_LOW_FLOOR = 0.30       # below this top score, no document referenced
+DOC_RESOLUTION_AUTO_MARGIN = 0.20     # gap between top two scores; below this is ambiguous
+MAX_MULTI_DOCUMENTS = 3               # cap on documents auto-combined or shown in the popup
+MULTI_DOCUMENT_KEYWORDS = ("and", "compare", "versus", "with", "both", "difference between")
+
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-12-v2"
 GEMINI_MODEL = "gemini-2.5-flash"

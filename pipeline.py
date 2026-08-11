@@ -10,7 +10,7 @@ import fitz
 import google.generativeai as genai
 from groq import Groq, RateLimitError
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer, util
 from unstructured.documents.elements import ListItem, NarrativeText, Table, Title
 from unstructured.partition.pdf import partition_pdf
 
@@ -411,6 +411,8 @@ def _seed_from_snapshot() -> None:
     with open(snapshot_documents, encoding="utf-8") as f:
         for row in json.load(f):
             database.register_document(row["filename"], row["chunk_count"], row["status"])
+            if row.get("summary"):
+                database.update_document_summary(row["filename"], row["summary"])
 
 
 def get_collection():
@@ -591,13 +593,51 @@ def handle_qa(final_query: str, session_id: str) -> dict:
 # Query pipeline — summarization (map-reduce)
 # ---------------------------------------------------------------------------
 
-def _detect_named_document(query: str, registered_filenames: list[str]):
+_title_embedding_cache = {"filenames": None, "embeddings": None}
+
+
+def _get_title_embeddings(registered_filenames: list[str]):
+    """Encodes the registered document titles once, cached until the
+    registered set changes (a new document ingested/removed)."""
+    if _title_embedding_cache["filenames"] != registered_filenames:
+        titles = [os.path.splitext(f)[0] for f in registered_filenames]
+        _title_embedding_cache["embeddings"] = embedding_model.encode(titles)
+        _title_embedding_cache["filenames"] = list(registered_filenames)
+    return _title_embedding_cache["embeddings"]
+
+
+def _resolve_documents(query: str, registered_filenames: list[str]) -> dict:
+    """Resolves which document(s), if any, a summarization query refers to via
+    embedding cosine similarity against registered document titles. Returns one of:
+      {"type": "none"}                          — no document referenced
+      {"type": "single", "filename": ...}       — one confident match
+      {"type": "multi", "filenames": [...]}     — multiple confident matches (conjunction query)
+      {"type": "ambiguous", "candidates": [...]} — top-scoring but unclear which one
+    """
+    if not registered_filenames:
+        return {"type": "none"}
+
+    title_embeddings = _get_title_embeddings(registered_filenames)
+    query_embedding = embedding_model.encode([query])[0]
+    scores = util.cos_sim(query_embedding, title_embeddings)[0].tolist()
+    scored = sorted(zip(registered_filenames, scores), key=lambda x: x[1], reverse=True)
+
+    top_filename, top_score = scored[0]
+    if top_score < config.DOC_RESOLUTION_LOW_FLOOR:
+        return {"type": "none"}
+
+    above_floor = [f for f, s in scored if s >= config.DOC_RESOLUTION_LOW_FLOOR]
     query_lower = query.lower()
-    for filename in registered_filenames:
-        stem = os.path.splitext(filename)[0].lower()
-        if stem in query_lower:
-            return filename
-    return None
+    has_conjunction = any(kw in query_lower for kw in config.MULTI_DOCUMENT_KEYWORDS)
+
+    if has_conjunction and len(above_floor) >= 2:
+        return {"type": "multi", "filenames": above_floor[: config.MAX_MULTI_DOCUMENTS]}
+
+    second_score = scored[1][1] if len(scored) > 1 else 0.0
+    if top_score - second_score >= config.DOC_RESOLUTION_AUTO_MARGIN:
+        return {"type": "single", "filename": top_filename}
+
+    return {"type": "ambiguous", "candidates": above_floor[: config.MAX_MULTI_DOCUMENTS]}
 
 
 def _fetch_document_chunks(collection, filename=None) -> list[dict]:
@@ -642,46 +682,81 @@ def _summarize_chunks(chunks: list[dict]) -> str:
         return "I encountered an error processing your request. Please try again."
 
 
-def handle_summarization(final_query: str, session_id: str) -> dict:
-    collection = get_collection()
-    registered = database.get_registered_documents()
-    matched_filename = _detect_named_document(final_query, registered)
+_DOCS_PER_ANSWER_BATCH = config.MAX_MULTI_DOCUMENTS
 
-    if matched_filename:
-        chunks = _fetch_document_chunks(collection, matched_filename)
-        summary = _summarize_chunks(chunks)
-        return {
-            "answer": summary,
-            "sources": [{"document": matched_filename, "page": None}],
-            "chunks_used": len(chunks),
-        }
 
-    total_chunks = 0
-    doc_summaries = []
-    for filename in registered:
-        chunks = _fetch_document_chunks(collection, filename)
-        if not chunks:
-            continue
-        total_chunks += len(chunks)
-        doc_summary = _summarize_chunks(chunks)
-        doc_summaries.append(f"## {filename}\n{doc_summary}")
+def _answer_from_documents(content_blocks: list[str], question: str) -> str:
+    """Answers `question` from a list of per-document content blocks (pre-baked
+    or fallback-generated summaries). Single-call for a small number of documents;
+    batches otherwise — combining all documents' summaries in one request (the
+    "summarize everything" case) would otherwise exceed the free-tier TPM limit."""
+    if len(content_blocks) <= _DOCS_PER_ANSWER_BATCH:
+        combined = "\n\n".join(content_blocks)
+        return _call_groq_text_resilient(SUMMARIZE_PROMPT, f"{combined}\n\nQuestion: {question}")
 
-    if not doc_summaries:
-        return {"answer": FALLBACK_MESSAGE, "sources": [], "chunks_used": 0}
-
-    combined_text = "\n\n".join(doc_summaries)
-    try:
-        overview = _call_groq_text_resilient(
-            SUMMARIZE_PROMPT, f"Combine these per-document summaries into one overview:\n\n{combined_text}"
+    batches = [
+        content_blocks[i : i + _DOCS_PER_ANSWER_BATCH]
+        for i in range(0, len(content_blocks), _DOCS_PER_ANSWER_BATCH)
+    ]
+    partial_answers = []
+    for batch in batches:
+        combined = "\n\n".join(batch)
+        partial_answers.append(
+            _call_groq_text_resilient(SUMMARIZE_PROMPT, f"{combined}\n\nQuestion: {question}")
         )
+    combined_partials = "\n\n".join(f"Partial answer {i + 1}:\n{a}" for i, a in enumerate(partial_answers))
+    return _call_groq_text_resilient(SUMMARIZE_PROMPT, f"{combined_partials}\n\nQuestion: {question}")
+
+
+def handle_summarization(final_query: str, session_id: str, resolution: dict) -> dict:
+    """resolution is the output of _resolve_documents() — computed by the caller
+    (app.py) so it can intercept an "ambiguous" result with a disambiguation
+    popup before ever reaching this function. A "single"/"multi" resolution
+    answers from the named document(s); anything else (including "ambiguous",
+    which app.py should not be passing through) falls back to all-documents mode."""
+    collection = get_collection()
+    resolution_type = resolution.get("type", "none")
+
+    if resolution_type == "single":
+        filenames = [resolution["filename"]]
+    elif resolution_type == "multi":
+        filenames = resolution["filenames"]
+    else:
+        filenames = database.get_registered_documents()
+
+    content_blocks = []
+    documents_used = []
+    chunks_used_total = 0
+
+    for filename in filenames:
+        summary = database.get_document_summary(filename)
+        if not summary:
+            chunks = _fetch_document_chunks(collection, filename)
+            if not chunks:
+                continue
+            summary = _summarize_chunks(chunks)
+            chunks_used_total += len(chunks)
+        content_blocks.append(f"## {filename}\n{summary}")
+        documents_used.append(filename)
+
+    if not content_blocks:
+        return {"answer": FALLBACK_MESSAGE, "sources": [], "chunks_used": 0, "documents_used": []}
+
+    try:
+        answer = _answer_from_documents(content_blocks, final_query)
     except RateLimitedError:
         raise
     except Exception as exc:
-        logger.error("Groq call failed combining document summaries: %s", exc)
-        overview = "I encountered an error processing your request. Please try again."
+        logger.error("Groq call failed during summarization: %s", exc)
+        answer = "I encountered an error processing your request. Please try again."
 
-    sources = [{"document": f, "page": None} for f in registered]
-    return {"answer": overview, "sources": sources, "chunks_used": total_chunks}
+    sources = [{"document": f, "page": None} for f in documents_used]
+    return {
+        "answer": answer,
+        "sources": sources,
+        "chunks_used": chunks_used_total,
+        "documents_used": documents_used,
+    }
 
 
 # ---------------------------------------------------------------------------

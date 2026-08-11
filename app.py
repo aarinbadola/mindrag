@@ -74,6 +74,16 @@ def _format_sources_display(sources):
     return "\n".join(parts)
 
 
+def _format_usage_metric(intent, chunks_used, sources):
+    """Chunks Used" for QA responses (a count), "Documents Used" (names) for
+    summarization responses — same textbox, different label depending on intent."""
+    if intent == "summarization":
+        names = [s["document"] for s in (sources or [])]
+        value = ", ".join(names) if names else "none"
+        return gr.update(label="Documents Used", value=value)
+    return gr.update(label="Chunks Used", value=f"{chunks_used} chunks")
+
+
 def _messages_to_chatbot_history(messages):
     history = []
     pending_user = None
@@ -88,6 +98,11 @@ def _messages_to_chatbot_history(messages):
 
 _READY_QUERY_BOX = gr.update(interactive=True, placeholder="Ask a question about the documents...")
 _READY_SEND_BTN = gr.update(interactive=True)
+
+# Shared "no-op" updates for the tail of the unified output tuple (disambiguation
+# popup fields) when a code path has nothing to say about them.
+_DISAMBIG_NOOP = (gr.update(), gr.update(), gr.update(), gr.update())
+_DISAMBIG_HIDDEN = (gr.update(visible=False), gr.update(), gr.update(), gr.update())
 
 
 def _rate_limit_updates(retry_after: int):
@@ -109,21 +124,31 @@ def rehydrate_session(session_id):
     history = _messages_to_chatbot_history(messages)
     last = database.get_last_assistant_message(session_id)
     if last is None:
-        return session_id, history, "", "", "", _READY_QUERY_BOX, _READY_SEND_BTN
+        return session_id, history, "", gr.update(label="Chunks Used", value=""), "", _READY_QUERY_BOX, _READY_SEND_BTN
     latency_text = f"{last['latency_ms']} ms" if last["latency_ms"] is not None else ""
-    chunks_text = f"{last['chunks_used']} chunks" if last["chunks_used"] is not None else ""
+    chunks_update = _format_usage_metric(last["intent"], last["chunks_used"], last["sources"])
     sources_text = _format_sources_display(last["sources"])
-    return session_id, history, latency_text, chunks_text, sources_text, _READY_QUERY_BOX, _READY_SEND_BTN
+    return session_id, history, latency_text, chunks_update, sources_text, _READY_QUERY_BOX, _READY_SEND_BTN
 
 
-def _run_query(raw_query, final_query, was_rewritten, history, session_id):
-    start = time.time()
+def _classify_and_maybe_resolve(final_query):
+    """Classifies intent, and for summarization queries also resolves which
+    document(s) it refers to. Resolution is computed here (once) so an
+    "ambiguous" result can be intercepted before handle_summarization runs."""
     intent = pipeline.classify_intent(final_query)
+    resolution = None
+    if intent == "summarization":
+        resolution = pipeline._resolve_documents(final_query, database.get_registered_documents())
+    return intent, resolution
+
+
+def _run_query(raw_query, final_query, was_rewritten, history, session_id, intent, resolution):
+    start = time.time()
 
     if intent == "recap":
         result = pipeline.handle_recap(session_id)
     elif intent == "summarization":
-        result = pipeline.handle_summarization(final_query, session_id)
+        result = pipeline.handle_summarization(final_query, session_id, resolution)
     else:
         result = pipeline.handle_qa(final_query, session_id)
 
@@ -154,27 +179,106 @@ def _run_query(raw_query, final_query, was_rewritten, history, session_id):
 
     updated_history = history + [[raw_query, result["answer"]]]
     latency_text = f"{latency_ms} ms"
-    chunks_text = f"{result['chunks_used']} chunks"
+    chunks_update = _format_usage_metric(intent, result["chunks_used"], result["sources"])
     sources_text = _format_sources_display(result["sources"])
 
-    return updated_history, latency_text, chunks_text, sources_text
+    return updated_history, latency_text, chunks_update, sources_text
+
+
+def _disambiguation_pause_tuple(history, raw_query, final_query, was_rewritten, candidates):
+    btn_updates = []
+    for i in range(3):
+        if i < len(candidates):
+            btn_updates.append(gr.update(visible=True, value=candidates[i]))
+        else:
+            btn_updates.append(gr.update(visible=False))
+    return (
+        history,
+        gr.update(visible=False), "", "", "",
+        gr.update(), gr.update(), gr.update(),
+        gr.update(), gr.update(), gr.update(),
+        gr.update(visible=True), *btn_updates,
+        raw_query, final_query, was_rewritten, candidates,
+    )
+
+
+def _run_or_pause_for_disambiguation(raw_query, final_query, was_rewritten, history, session_id):
+    try:
+        intent, resolution = _classify_and_maybe_resolve(final_query)
+
+        if resolution and resolution["type"] == "ambiguous":
+            return _disambiguation_pause_tuple(
+                history, raw_query, final_query, was_rewritten, resolution["candidates"]
+            )
+
+        updated_history, latency_text, chunks_text, sources_text = _run_query(
+            raw_query, final_query, was_rewritten, history, session_id, intent, resolution
+        )
+        return (
+            updated_history,
+            gr.update(visible=False), "", "", "",
+            latency_text, chunks_text, sources_text,
+            gr.update(), gr.update(), gr.update(),
+            *_DISAMBIG_HIDDEN, "", "", False, [],
+        )
+    except pipeline.RateLimitedError as exc:
+        query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
+        return (
+            history,
+            gr.update(visible=False), "", "", "",
+            gr.update(), gr.update(), gr.update(),
+            query_update, send_update, cooldown_value,
+            *_DISAMBIG_HIDDEN, "", "", False, [],
+        )
+
+
+def _finish_after_disambiguation(raw_query, final_query, was_rewritten, history, session_id, resolution):
+    try:
+        updated_history, latency_text, chunks_text, sources_text = _run_query(
+            raw_query, final_query, was_rewritten, history, session_id, "summarization", resolution
+        )
+        return (
+            updated_history,
+            gr.update(visible=False), "", "", "",
+            latency_text, chunks_text, sources_text,
+            gr.update(), gr.update(), gr.update(),
+            *_DISAMBIG_HIDDEN, "", "", False, [],
+        )
+    except pipeline.RateLimitedError as exc:
+        query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
+        return (
+            history,
+            gr.update(visible=False), "", "", "",
+            gr.update(), gr.update(), gr.update(),
+            query_update, send_update, cooldown_value,
+            *_DISAMBIG_HIDDEN, "", "", False, [],
+        )
+
+
+def resolve_disambiguation_choice(chosen_filename, raw_query, final_query, was_rewritten, history, session_id):
+    resolution = {"type": "single", "filename": chosen_filename}
+    return _finish_after_disambiguation(raw_query, final_query, was_rewritten, history, session_id, resolution)
+
+
+def resolve_disambiguation_everything(raw_query, final_query, was_rewritten, history, session_id):
+    resolution = {"type": "none"}
+    return _finish_after_disambiguation(raw_query, final_query, was_rewritten, history, session_id, resolution)
+
+
+def _noop_tuple(history):
+    return (
+        history,
+        gr.update(), gr.update(), gr.update(), gr.update(),
+        gr.update(), gr.update(), gr.update(),
+        gr.update(), gr.update(), gr.update(),
+        gr.update(), gr.update(), gr.update(), gr.update(),
+        gr.update(), gr.update(), gr.update(), gr.update(),
+    )
 
 
 def check_rewrite_step(raw_query, history, session_id):
     if not raw_query or not raw_query.strip() or not session_id:
-        return (
-            history,
-            gr.update(visible=False),
-            "",
-            "",
-            "",
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        )
+        return _noop_tuple(history)
 
     try:
         result = pipeline.check_and_rewrite(raw_query, session_id)
@@ -182,107 +286,31 @@ def check_rewrite_step(raw_query, history, session_id):
         if result["needs_rewrite"]:
             return (
                 history,
-                gr.update(visible=True),
-                result["rewritten_query"],
-                raw_query,
-                result["rewritten_query"],
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
+                gr.update(visible=True), result["rewritten_query"], raw_query, result["rewritten_query"],
+                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(),
+                *_DISAMBIG_NOOP, gr.update(), gr.update(), gr.update(), gr.update(),
             )
 
-        updated_history, latency_text, chunks_text, sources_text = _run_query(
-            raw_query, raw_query, False, history, session_id
-        )
-        return (
-            updated_history,
-            gr.update(visible=False),
-            "",
-            "",
-            "",
-            latency_text,
-            chunks_text,
-            sources_text,
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        )
+        return _run_or_pause_for_disambiguation(raw_query, raw_query, False, history, session_id)
+
     except pipeline.RateLimitedError as exc:
         query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
         return (
             history,
-            gr.update(visible=False),
-            "",
-            "",
-            "",
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            query_update,
-            send_update,
-            cooldown_value,
+            gr.update(visible=False), "", "", "",
+            gr.update(), gr.update(), gr.update(),
+            query_update, send_update, cooldown_value,
+            *_DISAMBIG_HIDDEN, "", "", False, [],
         )
 
 
 def confirm_rewrite(rewritten_query, raw_query, history, session_id):
-    try:
-        updated_history, latency_text, chunks_text, sources_text = _run_query(
-            raw_query, rewritten_query, True, history, session_id
-        )
-        return (
-            updated_history,
-            gr.update(visible=False),
-            latency_text,
-            chunks_text,
-            sources_text,
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        )
-    except pipeline.RateLimitedError as exc:
-        query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
-        return (
-            history,
-            gr.update(visible=False),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            query_update,
-            send_update,
-            cooldown_value,
-        )
+    return _run_or_pause_for_disambiguation(raw_query, rewritten_query, True, history, session_id)
 
 
 def use_original(raw_query, history, session_id):
-    try:
-        updated_history, latency_text, chunks_text, sources_text = _run_query(
-            raw_query, raw_query, False, history, session_id
-        )
-        return (
-            updated_history,
-            gr.update(visible=False),
-            latency_text,
-            chunks_text,
-            sources_text,
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        )
-    except pipeline.RateLimitedError as exc:
-        query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
-        return (
-            history,
-            gr.update(visible=False),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            query_update,
-            send_update,
-            cooldown_value,
-        )
+    return _run_or_pause_for_disambiguation(raw_query, raw_query, False, history, session_id)
 
 
 with gr.Blocks(theme=gr.themes.Default()) as demo:
@@ -292,6 +320,11 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
     session_id_box = gr.Textbox(visible=False)
     cooldown_seconds_box = gr.Number(visible=False, value=0, elem_id="cooldown-seconds-box")
     cooldown_done_box = gr.Textbox(visible=False, elem_id="cooldown-done-box")
+
+    disambig_raw_query_state = gr.State("")
+    disambig_final_query_state = gr.State("")
+    disambig_was_rewritten_state = gr.State(False)
+    disambig_candidates_state = gr.State([])
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -310,6 +343,13 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
                     confirm_btn = gr.Button("✓ Confirm", variant="primary")
                     use_original_btn = gr.Button("Use original", variant="secondary")
 
+            with gr.Group(visible=False) as disambig_group:
+                gr.Markdown("Which document are you asking about?")
+                disambig_btn_1 = gr.Button(visible=False)
+                disambig_btn_2 = gr.Button(visible=False)
+                disambig_btn_3 = gr.Button(visible=False)
+                disambig_everything_btn = gr.Button("Summarize everything", variant="secondary")
+
             with gr.Row():
                 query_box = gr.Textbox(
                     placeholder="Loading session...",
@@ -326,39 +366,70 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
 
             clear_btn = gr.Button("Clear Conversation")
 
-    send_outputs = [
+    # Unified output tuple shared by every handler that can advance the query
+    # flow (send, confirm/cancel rewrite, resolve/bypass disambiguation) — each
+    # handler fills in only the fields relevant to its own transition and uses
+    # gr.update() no-ops for the rest.
+    ALL_OUTPUTS = [
         chatbot,
-        rewrite_group,
-        rewrite_box,
-        raw_state,
-        rewritten_state,
-        latency_box,
-        chunks_box,
-        sources_box,
-        query_box,
-        send_btn,
-        cooldown_seconds_box,
+        rewrite_group, rewrite_box, raw_state, rewritten_state,
+        latency_box, chunks_box, sources_box,
+        query_box, send_btn, cooldown_seconds_box,
+        disambig_group, disambig_btn_1, disambig_btn_2, disambig_btn_3,
+        disambig_raw_query_state, disambig_final_query_state,
+        disambig_was_rewritten_state, disambig_candidates_state,
     ]
 
-    send_btn.click(fn=check_rewrite_step, inputs=[query_box, chatbot, session_state], outputs=send_outputs).then(
+    send_btn.click(fn=check_rewrite_step, inputs=[query_box, chatbot, session_state], outputs=ALL_OUTPUTS).then(
         fn=lambda: "", inputs=None, outputs=[query_box]
     )
-    query_box.submit(fn=check_rewrite_step, inputs=[query_box, chatbot, session_state], outputs=send_outputs).then(
+    query_box.submit(fn=check_rewrite_step, inputs=[query_box, chatbot, session_state], outputs=ALL_OUTPUTS).then(
         fn=lambda: "", inputs=None, outputs=[query_box]
     )
-
-    rewrite_outputs = [chatbot, rewrite_group, latency_box, chunks_box, sources_box, query_box, send_btn, cooldown_seconds_box]
 
     confirm_btn.click(
         fn=confirm_rewrite,
         inputs=[rewritten_state, raw_state, chatbot, session_state],
-        outputs=rewrite_outputs,
+        outputs=ALL_OUTPUTS,
     )
 
     use_original_btn.click(
         fn=use_original,
         inputs=[raw_state, chatbot, session_state],
-        outputs=rewrite_outputs,
+        outputs=ALL_OUTPUTS,
+    )
+
+    disambig_btn_1.click(
+        fn=resolve_disambiguation_choice,
+        inputs=[
+            disambig_btn_1, disambig_raw_query_state, disambig_final_query_state,
+            disambig_was_rewritten_state, chatbot, session_state,
+        ],
+        outputs=ALL_OUTPUTS,
+    )
+    disambig_btn_2.click(
+        fn=resolve_disambiguation_choice,
+        inputs=[
+            disambig_btn_2, disambig_raw_query_state, disambig_final_query_state,
+            disambig_was_rewritten_state, chatbot, session_state,
+        ],
+        outputs=ALL_OUTPUTS,
+    )
+    disambig_btn_3.click(
+        fn=resolve_disambiguation_choice,
+        inputs=[
+            disambig_btn_3, disambig_raw_query_state, disambig_final_query_state,
+            disambig_was_rewritten_state, chatbot, session_state,
+        ],
+        outputs=ALL_OUTPUTS,
+    )
+    disambig_everything_btn.click(
+        fn=resolve_disambiguation_everything,
+        inputs=[
+            disambig_raw_query_state, disambig_final_query_state,
+            disambig_was_rewritten_state, chatbot, session_state,
+        ],
+        outputs=ALL_OUTPUTS,
     )
 
     clear_btn.click(fn=None, inputs=None, outputs=[session_id_box], js=NEW_SESSION_JS)
