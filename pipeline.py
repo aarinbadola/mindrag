@@ -70,6 +70,7 @@ def _load_prompt(filename: str) -> str:
 
 
 IMAGE_DESCRIPTION_PROMPT = _load_prompt("image_description.md")
+RESOLVE_DOCUMENTS_PROMPT = _load_prompt("resolve_documents.md")
 REWRITE_PROMPT = _load_prompt("rewrite.md")
 CLASSIFY_PROMPT = _load_prompt("classify.md")
 QA_ANSWER_PROMPT = _load_prompt("qa_answer.md")
@@ -606,22 +607,10 @@ def _get_title_embeddings(registered_filenames: list[str]):
     return _title_embedding_cache["embeddings"]
 
 
-def _resolve_documents(query: str, registered_filenames: list[str]) -> dict:
-    """Resolves which document(s), if any, a summarization query refers to via
-    embedding cosine similarity against registered document titles. Returns one of:
-      {"type": "none"}                          — no document referenced
-      {"type": "single", "filename": ...}       — one confident match
-      {"type": "multi", "filenames": [...]}     — multiple confident matches (conjunction query)
-      {"type": "ambiguous", "candidates": [...]} — top-scoring but unclear which one
-    """
-    if not registered_filenames:
-        return {"type": "none"}
-
-    title_embeddings = _get_title_embeddings(registered_filenames)
-    query_embedding = embedding_model.encode([query])[0]
-    scores = util.cos_sim(query_embedding, title_embeddings)[0].tolist()
-    scored = sorted(zip(registered_filenames, scores), key=lambda x: x[1], reverse=True)
-
+def _resolve_documents_embedding_only(query: str, registered_filenames: list[str], scored: list) -> dict:
+    """Pure embedding+keyword resolution — used as the fallback when the LLM
+    resolver call fails/is unparseable. `scored` is the pre-computed
+    (filename, cosine_score) list, sorted descending."""
     top_filename, top_score = scored[0]
     if top_score < config.DOC_RESOLUTION_LOW_FLOOR:
         return {"type": "none"}
@@ -638,6 +627,79 @@ def _resolve_documents(query: str, registered_filenames: list[str]) -> dict:
         return {"type": "single", "filename": top_filename}
 
     return {"type": "ambiguous", "candidates": above_floor[: config.MAX_MULTI_DOCUMENTS]}
+
+
+def _resolve_documents_llm(query: str, registered_filenames: list[str]) -> list[str] | None:
+    """Asks Groq which document(s) the query refers to, grounded in the actual
+    registered titles so it can't hallucinate one. Returns a list of exactly-
+    matching registered filenames (possibly empty — "no document referenced"),
+    or None if the call/parse failed or returned nothing matchable (caller
+    falls back to pure embedding resolution)."""
+    titles = [os.path.splitext(f)[0] for f in registered_filenames]
+    title_to_filename = dict(zip(titles, registered_filenames))
+    doc_list = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
+    user_content = f"DOCUMENT LIST:\n{doc_list}\n\nQUERY: {query}"
+
+    result = _call_groq_json(RESOLVE_DOCUMENTS_PROMPT, user_content)
+    if not result or not isinstance(result.get("documents"), list):
+        return None
+
+    resolved = []
+    for item in result["documents"]:
+        title = item.get("title") if isinstance(item, dict) else item
+        if not isinstance(title, str):
+            continue
+        title = re.sub(r"^\d+[.)]\s*", "", title).strip()
+        filename = title_to_filename.get(title)
+        if filename and filename not in resolved:
+            resolved.append(filename)
+    return resolved
+
+
+def _resolve_documents(query: str, registered_filenames: list[str]) -> dict:
+    """Resolves which document(s), if any, a summarization query refers to.
+    Hybrid: an LLM call (grounded in the actual titles) identifies WHICH
+    document(s) are referenced — it handles arbitrary phrasing ("differ from",
+    a bare comma list, etc.) that keyword gating misses. Embedding cosine
+    similarity supplies a calibrated ambiguity check for the single-document
+    case — the LLM tends to confidently pick one document even when several
+    are genuinely plausible, where an explicit numeric margin correctly flags
+    that as uncertain. Falls back to pure embedding+keyword resolution if the
+    LLM call fails. Returns one of:
+      {"type": "none"}                          — no document referenced
+      {"type": "single", "filename": ...}       — one confident match
+      {"type": "multi", "filenames": [...]}     — multiple confident matches
+      {"type": "ambiguous", "candidates": [...]} — top-scoring but unclear which one
+    """
+    if not registered_filenames:
+        return {"type": "none"}
+
+    title_embeddings = _get_title_embeddings(registered_filenames)
+    query_embedding = embedding_model.encode([query])[0]
+    scores = util.cos_sim(query_embedding, title_embeddings)[0].tolist()
+    scored = sorted(zip(registered_filenames, scores), key=lambda x: x[1], reverse=True)
+    score_by_filename = dict(zip(registered_filenames, scores))
+
+    llm_docs = _resolve_documents_llm(query, registered_filenames)
+    if llm_docs is None:
+        return _resolve_documents_embedding_only(query, registered_filenames, scored)
+
+    if len(llm_docs) == 0:
+        return {"type": "none"}
+
+    if len(llm_docs) >= 2:
+        return {"type": "multi", "filenames": llm_docs[: config.MAX_MULTI_DOCUMENTS]}
+
+    chosen = llm_docs[0]
+    chosen_score = score_by_filename.get(chosen, 0.0)
+    others = [(f, s) for f, s in scored if f != chosen]
+    runner_up_score = others[0][1] if others else 0.0
+
+    if chosen_score - runner_up_score >= config.DOC_RESOLUTION_AUTO_MARGIN:
+        return {"type": "single", "filename": chosen}
+
+    candidates = [chosen] + [f for f, s in others if s >= config.DOC_RESOLUTION_LOW_FLOOR]
+    return {"type": "ambiguous", "candidates": candidates[: config.MAX_MULTI_DOCUMENTS]}
 
 
 def _fetch_document_chunks(collection, filename=None) -> list[dict]:
