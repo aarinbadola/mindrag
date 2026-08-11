@@ -20,6 +20,10 @@ DISAMBIGUATION RULES:
 - "what is in/there in this document" or "what does this document/PDF contain"
   or "what's this document about" → "summarization" (asking about a whole
   document's contents is a summary request, even when phrased as "what is")
+- "compare X and Y", "what's the difference between X and Y", or "how do X and
+  Y differ" where X and Y are documents or topics covered by different
+  documents → "summarization" (comparing whole documents needs their overall
+  content, not a single factual lookup)
 - "what is X" asking about a specific fact, term, or concept → "qa"
 - When unsure between qa and summarization → choose "qa"
 - When unsure between recap and summarization → choose "recap"
