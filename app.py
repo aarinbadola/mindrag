@@ -76,8 +76,8 @@ def _format_sources_display(sources):
 
 def _format_usage_metric(intent, chunks_used, sources):
     """Chunks Used" for QA responses (a count), "Documents Used" (names) for
-    summarization responses — same textbox, different label depending on intent."""
-    if intent == "summarization":
+    summarization/diff responses — same textbox, different label depending on intent."""
+    if intent in ("summarization", "diff"):
         names = [s["document"] for s in (sources or [])]
         value = ", ".join(names) if names else "none"
         return gr.update(label="Documents Used", value=value)
@@ -132,12 +132,14 @@ def rehydrate_session(session_id):
 
 
 def _classify_and_maybe_resolve(final_query):
-    """Classifies intent, and for summarization queries also resolves which
+    """Classifies intent, and for summarization/diff queries also resolves which
     document(s) it refers to. Resolution is computed here (once) so an
-    "ambiguous" result can be intercepted before handle_summarization runs."""
+    "ambiguous" result can be intercepted before handle_summarization runs —
+    diff handles its own ambiguous/single/none cases internally instead of
+    popping the UI (see _run_or_pause_for_disambiguation)."""
     intent = pipeline.classify_intent(final_query)
     resolution = None
-    if intent == "summarization":
+    if intent in ("summarization", "diff"):
         resolution = pipeline._resolve_documents(final_query, database.get_registered_documents())
     return intent, resolution
 
@@ -149,6 +151,8 @@ def _run_query(raw_query, final_query, was_rewritten, history, session_id, inten
         result = pipeline.handle_recap(session_id)
     elif intent == "summarization":
         result = pipeline.handle_summarization(final_query, session_id, resolution)
+    elif intent == "diff":
+        result = pipeline.handle_diff(final_query, session_id, resolution)
     else:
         result = pipeline.handle_qa(final_query, session_id)
 
@@ -206,7 +210,7 @@ def _run_or_pause_for_disambiguation(raw_query, final_query, was_rewritten, hist
     try:
         intent, resolution = _classify_and_maybe_resolve(final_query)
 
-        if resolution and resolution["type"] == "ambiguous":
+        if intent == "summarization" and resolution and resolution["type"] == "ambiguous":
             return _disambiguation_pause_tuple(
                 history, raw_query, final_query, was_rewritten, resolution["candidates"]
             )

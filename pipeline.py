@@ -76,6 +76,7 @@ CLASSIFY_PROMPT = _load_prompt("classify.md")
 QA_ANSWER_PROMPT = _load_prompt("qa_answer.md")
 SUMMARIZE_PROMPT = _load_prompt("summarize.md")
 RECAP_PROMPT = _load_prompt("recap.md")
+DIFF_PROMPT = _load_prompt("diff.md")
 
 FALLBACK_MESSAGE = "I couldn't find relevant information in the uploaded documents to answer this question."
 
@@ -486,7 +487,7 @@ def check_and_rewrite(raw_query: str, session_id: str) -> dict:
 # Query pipeline — intent classification
 # ---------------------------------------------------------------------------
 
-_VALID_INTENTS = {"qa", "summarization", "recap"}
+_VALID_INTENTS = {"qa", "summarization", "diff", "recap"}
 
 
 def classify_intent(final_query: str) -> str:
@@ -747,14 +748,15 @@ def _summarize_chunks(chunks: list[dict]) -> str:
 _DOCS_PER_ANSWER_BATCH = config.MAX_MULTI_DOCUMENTS
 
 
-def _answer_from_documents(content_blocks: list[str], question: str) -> str:
+def _answer_from_documents(content_blocks: list[str], question: str, prompt: str = SUMMARIZE_PROMPT) -> str:
     """Answers `question` from a list of per-document content blocks (pre-baked
-    or fallback-generated summaries). Single-call for a small number of documents;
-    batches otherwise — combining all documents' summaries in one request (the
-    "summarize everything" case) would otherwise exceed the free-tier TPM limit."""
+    or fallback-generated summaries), using `prompt` as the system prompt.
+    Single-call for a small number of documents; batches otherwise — combining
+    all documents' summaries in one request (the "summarize everything" case)
+    would otherwise exceed the free-tier TPM limit."""
     if len(content_blocks) <= _DOCS_PER_ANSWER_BATCH:
         combined = "\n\n".join(content_blocks)
-        return _call_groq_text_resilient(SUMMARIZE_PROMPT, f"{combined}\n\nQuestion: {question}")
+        return _call_groq_text_resilient(prompt, f"{combined}\n\nQuestion: {question}")
 
     batches = [
         content_blocks[i : i + _DOCS_PER_ANSWER_BATCH]
@@ -764,10 +766,33 @@ def _answer_from_documents(content_blocks: list[str], question: str) -> str:
     for batch in batches:
         combined = "\n\n".join(batch)
         partial_answers.append(
-            _call_groq_text_resilient(SUMMARIZE_PROMPT, f"{combined}\n\nQuestion: {question}")
+            _call_groq_text_resilient(prompt, f"{combined}\n\nQuestion: {question}")
         )
     combined_partials = "\n\n".join(f"Partial answer {i + 1}:\n{a}" for i, a in enumerate(partial_answers))
-    return _call_groq_text_resilient(SUMMARIZE_PROMPT, f"{combined_partials}\n\nQuestion: {question}")
+    return _call_groq_text_resilient(prompt, f"{combined_partials}\n\nQuestion: {question}")
+
+
+def _gather_document_content(collection, filenames: list[str]) -> tuple[list[str], list[str], int]:
+    """Fetches each document's content to answer from — its pre-baked summary,
+    or a live map-reduce fallback if it has none. Returns (content_blocks,
+    documents_used, chunks_used_total); shared by handle_summarization and
+    handle_diff so both stay consistent about the NULL-summary fallback."""
+    content_blocks = []
+    documents_used = []
+    chunks_used_total = 0
+
+    for filename in filenames:
+        summary = database.get_document_summary(filename)
+        if not summary:
+            chunks = _fetch_document_chunks(collection, filename)
+            if not chunks:
+                continue
+            summary = _summarize_chunks(chunks)
+            chunks_used_total += len(chunks)
+        content_blocks.append(f"## {filename}\n{summary}")
+        documents_used.append(filename)
+
+    return content_blocks, documents_used, chunks_used_total
 
 
 def handle_summarization(final_query: str, session_id: str, resolution: dict) -> dict:
@@ -786,20 +811,7 @@ def handle_summarization(final_query: str, session_id: str, resolution: dict) ->
     else:
         filenames = database.get_registered_documents()
 
-    content_blocks = []
-    documents_used = []
-    chunks_used_total = 0
-
-    for filename in filenames:
-        summary = database.get_document_summary(filename)
-        if not summary:
-            chunks = _fetch_document_chunks(collection, filename)
-            if not chunks:
-                continue
-            summary = _summarize_chunks(chunks)
-            chunks_used_total += len(chunks)
-        content_blocks.append(f"## {filename}\n{summary}")
-        documents_used.append(filename)
+    content_blocks, documents_used, chunks_used_total = _gather_document_content(collection, filenames)
 
     if not content_blocks:
         return {"answer": FALLBACK_MESSAGE, "sources": [], "chunks_used": 0, "documents_used": []}
@@ -810,6 +822,64 @@ def handle_summarization(final_query: str, session_id: str, resolution: dict) ->
         raise
     except Exception as exc:
         logger.error("Groq call failed during summarization: %s", exc)
+        answer = "I encountered an error processing your request. Please try again."
+
+    sources = [{"document": f, "page": None} for f in documents_used]
+    return {
+        "answer": answer,
+        "sources": sources,
+        "chunks_used": chunks_used_total,
+        "documents_used": documents_used,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Query pipeline — document comparison (diff)
+# ---------------------------------------------------------------------------
+
+def handle_diff(final_query: str, session_id: str, resolution: dict) -> dict:
+    """A diff needs two or more identified documents — unlike summarization,
+    there's no sensible "compare everything" fallback, so a single/ambiguous/
+    none resolution returns a clarifying response instead of guessing or
+    reusing the disambiguation popup (that stays summarization-only; its
+    "summarize everything" bypass button has no diff equivalent)."""
+    resolution_type = resolution.get("type", "none")
+
+    if resolution_type != "multi":
+        if resolution_type == "single":
+            answer = (
+                f"I can only compare two or more documents, but this only matched one: "
+                f"{resolution['filename']}. Try naming a second document to compare it against."
+            )
+        elif resolution_type == "ambiguous":
+            names = ", ".join(resolution["candidates"])
+            answer = (
+                f"I'm not sure which documents you want to compare — possible matches: {names}. "
+                f"Try naming them more specifically."
+            )
+        else:
+            answer = "I couldn't identify which documents you want to compare. Try naming them directly."
+        return {"answer": answer, "sources": [], "chunks_used": 0, "documents_used": []}
+
+    collection = get_collection()
+    content_blocks, documents_used, chunks_used_total = _gather_document_content(
+        collection, resolution["filenames"]
+    )
+
+    if len(documents_used) < 2:
+        return {
+            "answer": FALLBACK_MESSAGE,
+            "sources": [],
+            "chunks_used": chunks_used_total,
+            "documents_used": documents_used,
+        }
+
+    try:
+        answer = _answer_from_documents(content_blocks, final_query, prompt=DIFF_PROMPT)
+    except RateLimitedError:
+        raise
+    except Exception as exc:
+        logger.error("Groq call failed during diff: %s", exc)
         answer = "I encountered an error processing your request. Please try again."
 
     sources = [{"document": f, "page": None} for f in documents_used]
