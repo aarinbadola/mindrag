@@ -18,7 +18,11 @@ def _zerogpu_startup_probe():
 pipeline.startup()
 
 _registered_docs = database.get_registered_documents()
-_doc_list_md = "\n".join(f"- {name}" for name in _registered_docs) if _registered_docs else "_No documents loaded_"
+_doc_list_md = (
+    "\n".join(f"- {pipeline.get_document_title(name)}" for name in _registered_docs)
+    if _registered_docs
+    else "_No documents loaded_"
+)
 _doc_count_text = f"{len(_registered_docs)} documents loaded"
 
 SESSION_JS = """
@@ -42,6 +46,16 @@ NEW_SESSION_JS = """
 }
 """
 
+SCROLL_TO_QUERY_JS = """
+() => {
+    const container = document.querySelector('#chatbot .bubble-wrap');
+    if (!container) return;
+    const userRows = container.querySelectorAll('.message-row.user-row');
+    if (!userRows.length) return;
+    userRows[userRows.length - 1].scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+"""
+
 COOLDOWN_TIMER_JS = """
 () => {
     const numberInput = document.querySelector('#cooldown-seconds-box input');
@@ -49,6 +63,20 @@ COOLDOWN_TIMER_JS = """
     if (!seconds || seconds <= 0) {
         return;
     }
+    const queryInput = document.querySelector('#query-box textarea');
+    let remaining = Math.ceil(seconds);
+    const tick = () => {
+        if (queryInput) {
+            queryInput.placeholder = `Rate limited — retry in ${remaining}s...`;
+        }
+        if (remaining <= 0) {
+            clearInterval(intervalId);
+            return;
+        }
+        remaining -= 1;
+    };
+    tick();
+    const intervalId = setInterval(tick, 1000);
     setTimeout(() => {
         const doneBox = document.querySelector('#cooldown-done-box textarea');
         if (doneBox) {
@@ -82,6 +110,15 @@ def _format_usage_metric(intent, chunks_used, sources):
         value = ", ".join(names) if names else "none"
         return gr.update(label="Documents Used", value=value)
     return gr.update(label="Chunks Used", value=f"{chunks_used} chunks")
+
+
+def _onboarding_entry():
+    """Permanent first chat entry — capabilities + example queries + domain
+    hint, styled as a markdown blockquote so it reads as system content
+    rather than a normal message, without needing custom CSS."""
+    content = pipeline.get_onboarding_content(database.get_registered_documents())
+    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in content.split("\n"))
+    return [None, quoted]
 
 
 def _messages_to_chatbot_history(messages):
@@ -121,7 +158,7 @@ def rehydrate_session(session_id):
         # leave the input disabled rather than allow queries with no session to log against.
         return session_id, [], "", "", "", gr.update(), gr.update()
     messages = database.get_all_messages(session_id)
-    history = _messages_to_chatbot_history(messages)
+    history = [_onboarding_entry()] + _messages_to_chatbot_history(messages)
     last = database.get_last_assistant_message(session_id)
     if last is None:
         return session_id, history, "", gr.update(label="Chunks Used", value=""), "", _READY_QUERY_BOX, _READY_SEND_BTN
@@ -153,6 +190,8 @@ def _run_query(raw_query, final_query, was_rewritten, history, session_id, inten
         result = pipeline.handle_summarization(final_query, session_id, resolution)
     elif intent == "diff":
         result = pipeline.handle_diff(final_query, session_id, resolution)
+    elif intent == "meta":
+        result = pipeline.handle_meta()
     else:
         result = pipeline.handle_qa(final_query, session_id)
 
@@ -185,8 +224,9 @@ def _run_query(raw_query, final_query, was_rewritten, history, session_id, inten
     latency_text = f"{latency_ms} ms"
     chunks_update = _format_usage_metric(intent, result["chunks_used"], result["sources"])
     sources_text = _format_sources_display(result["sources"])
+    show_recovery = intent == "qa" and bool(result.get("is_fallback"))
 
-    return updated_history, latency_text, chunks_update, sources_text
+    return updated_history, latency_text, chunks_update, sources_text, show_recovery
 
 
 def _disambiguation_pause_tuple(history, raw_query, final_query, was_rewritten, candidates):
@@ -203,6 +243,7 @@ def _disambiguation_pause_tuple(history, raw_query, final_query, was_rewritten, 
         gr.update(), gr.update(), gr.update(),
         gr.update(visible=True), *btn_updates,
         raw_query, final_query, was_rewritten, candidates,
+        gr.update(visible=False),
     )
 
 
@@ -215,7 +256,7 @@ def _run_or_pause_for_disambiguation(raw_query, final_query, was_rewritten, hist
                 history, raw_query, final_query, was_rewritten, resolution["candidates"]
             )
 
-        updated_history, latency_text, chunks_text, sources_text = _run_query(
+        updated_history, latency_text, chunks_text, sources_text, show_recovery = _run_query(
             raw_query, final_query, was_rewritten, history, session_id, intent, resolution
         )
         return (
@@ -224,6 +265,7 @@ def _run_or_pause_for_disambiguation(raw_query, final_query, was_rewritten, hist
             latency_text, chunks_text, sources_text,
             gr.update(), gr.update(), gr.update(),
             *_DISAMBIG_HIDDEN, "", "", False, [],
+            gr.update(visible=show_recovery),
         )
     except pipeline.RateLimitedError as exc:
         query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
@@ -233,12 +275,13 @@ def _run_or_pause_for_disambiguation(raw_query, final_query, was_rewritten, hist
             gr.update(), gr.update(), gr.update(),
             query_update, send_update, cooldown_value,
             *_DISAMBIG_HIDDEN, "", "", False, [],
+            gr.update(visible=False),
         )
 
 
 def _finish_after_disambiguation(raw_query, final_query, was_rewritten, history, session_id, resolution):
     try:
-        updated_history, latency_text, chunks_text, sources_text = _run_query(
+        updated_history, latency_text, chunks_text, sources_text, _show_recovery = _run_query(
             raw_query, final_query, was_rewritten, history, session_id, "summarization", resolution
         )
         return (
@@ -247,6 +290,7 @@ def _finish_after_disambiguation(raw_query, final_query, was_rewritten, history,
             latency_text, chunks_text, sources_text,
             gr.update(), gr.update(), gr.update(),
             *_DISAMBIG_HIDDEN, "", "", False, [],
+            gr.update(visible=False),
         )
     except pipeline.RateLimitedError as exc:
         query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
@@ -256,6 +300,7 @@ def _finish_after_disambiguation(raw_query, final_query, was_rewritten, history,
             gr.update(), gr.update(), gr.update(),
             query_update, send_update, cooldown_value,
             *_DISAMBIG_HIDDEN, "", "", False, [],
+            gr.update(visible=False),
         )
 
 
@@ -277,6 +322,7 @@ def _noop_tuple(history):
         gr.update(), gr.update(), gr.update(),
         gr.update(), gr.update(), gr.update(), gr.update(),
         gr.update(), gr.update(), gr.update(), gr.update(),
+        gr.update(),
     )
 
 
@@ -294,6 +340,7 @@ def check_rewrite_step(raw_query, history, session_id):
                 gr.update(), gr.update(), gr.update(),
                 gr.update(), gr.update(), gr.update(),
                 *_DISAMBIG_NOOP, gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(visible=False),
             )
 
         return _run_or_pause_for_disambiguation(raw_query, raw_query, False, history, session_id)
@@ -306,6 +353,7 @@ def check_rewrite_step(raw_query, history, session_id):
             gr.update(), gr.update(), gr.update(),
             query_update, send_update, cooldown_value,
             *_DISAMBIG_HIDDEN, "", "", False, [],
+            gr.update(visible=False),
         )
 
 
@@ -315,6 +363,32 @@ def confirm_rewrite(rewritten_query, raw_query, history, session_id):
 
 def use_original(raw_query, history, session_id):
     return _run_or_pause_for_disambiguation(raw_query, raw_query, False, history, session_id)
+
+
+def recovery_show_capabilities(history):
+    """'Show me what I can ask' — zero LLM call, just renders the shared
+    onboarding content as a new chat entry."""
+    content = pipeline.get_onboarding_content(database.get_registered_documents())
+    updated_history = history + [[None, content]]
+    return updated_history, gr.update(visible=False), gr.update(), gr.update(), gr.update()
+
+
+def recovery_get_overview(history):
+    """'Get an overview of the documents' — a real all-documents summarization
+    call, cached after first generation (pipeline.get_documents_overview)."""
+    try:
+        content = pipeline.get_documents_overview()
+        updated_history = history + [[None, content]]
+        return updated_history, gr.update(visible=False), gr.update(), gr.update(), gr.update()
+    except pipeline.RateLimitedError as exc:
+        query_update, send_update, cooldown_value = _rate_limit_updates(exc.retry_after)
+        return history, gr.update(visible=False), query_update, send_update, cooldown_value
+
+
+def recovery_rephrase(history):
+    """'Let me rephrase' — closes the popup with no backend call; the next
+    message goes through the normal flow from scratch."""
+    return history, gr.update(visible=False), gr.update(), gr.update(), gr.update()
 
 
 with gr.Blocks(theme=gr.themes.Default()) as demo:
@@ -336,10 +410,10 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             gr.Markdown("### Knowledge Base")
             gr.Markdown(_doc_list_md)
             gr.Markdown(_doc_count_text)
-            gr.Markdown("Supports: Document QA · Summarization · Conversation Recap")
+            gr.Markdown("Supports: Document QA · Summarization · Diff/Comparison · Conversation Recap")
 
         with gr.Column(scale=2):
-            chatbot = gr.Chatbot(bubble_full_width=False, height=500)
+            chatbot = gr.Chatbot(bubble_full_width=False, height=500, elem_id="chatbot")
 
             with gr.Group(visible=False) as rewrite_group:
                 rewrite_box = gr.Textbox(label="Suggested rewrite", interactive=False)
@@ -354,12 +428,18 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
                 disambig_btn_3 = gr.Button(visible=False)
                 disambig_everything_btn = gr.Button("Summarize everything", variant="secondary")
 
+            with gr.Group(visible=False) as recovery_group:
+                recovery_show_btn = gr.Button("Show me what I can ask", variant="secondary")
+                recovery_overview_btn = gr.Button("Get an overview of the documents", variant="secondary")
+                recovery_rephrase_btn = gr.Button("Let me rephrase", variant="secondary")
+
             with gr.Row():
                 query_box = gr.Textbox(
                     placeholder="Loading session...",
                     show_label=False,
                     scale=4,
                     interactive=False,
+                    elem_id="query-box",
                 )
                 send_btn = gr.Button("Send", variant="primary", scale=1, interactive=False)
 
@@ -382,26 +462,27 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
         disambig_group, disambig_btn_1, disambig_btn_2, disambig_btn_3,
         disambig_raw_query_state, disambig_final_query_state,
         disambig_was_rewritten_state, disambig_candidates_state,
+        recovery_group,
     ]
 
     send_btn.click(fn=check_rewrite_step, inputs=[query_box, chatbot, session_state], outputs=ALL_OUTPUTS).then(
         fn=lambda: "", inputs=None, outputs=[query_box]
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
     query_box.submit(fn=check_rewrite_step, inputs=[query_box, chatbot, session_state], outputs=ALL_OUTPUTS).then(
         fn=lambda: "", inputs=None, outputs=[query_box]
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
 
     confirm_btn.click(
         fn=confirm_rewrite,
         inputs=[rewritten_state, raw_state, chatbot, session_state],
         outputs=ALL_OUTPUTS,
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
 
     use_original_btn.click(
         fn=use_original,
         inputs=[raw_state, chatbot, session_state],
         outputs=ALL_OUTPUTS,
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
 
     disambig_btn_1.click(
         fn=resolve_disambiguation_choice,
@@ -410,7 +491,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             disambig_was_rewritten_state, chatbot, session_state,
         ],
         outputs=ALL_OUTPUTS,
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
     disambig_btn_2.click(
         fn=resolve_disambiguation_choice,
         inputs=[
@@ -418,7 +499,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             disambig_was_rewritten_state, chatbot, session_state,
         ],
         outputs=ALL_OUTPUTS,
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
     disambig_btn_3.click(
         fn=resolve_disambiguation_choice,
         inputs=[
@@ -426,7 +507,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             disambig_was_rewritten_state, chatbot, session_state,
         ],
         outputs=ALL_OUTPUTS,
-    )
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
     disambig_everything_btn.click(
         fn=resolve_disambiguation_everything,
         inputs=[
@@ -434,6 +515,22 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             disambig_was_rewritten_state, chatbot, session_state,
         ],
         outputs=ALL_OUTPUTS,
+    ).then(fn=None, inputs=None, outputs=None, js=SCROLL_TO_QUERY_JS)
+
+    recovery_show_btn.click(
+        fn=recovery_show_capabilities,
+        inputs=[chatbot],
+        outputs=[chatbot, recovery_group, query_box, send_btn, cooldown_seconds_box],
+    )
+    recovery_overview_btn.click(
+        fn=recovery_get_overview,
+        inputs=[chatbot],
+        outputs=[chatbot, recovery_group, query_box, send_btn, cooldown_seconds_box],
+    )
+    recovery_rephrase_btn.click(
+        fn=recovery_rephrase,
+        inputs=[chatbot],
+        outputs=[chatbot, recovery_group, query_box, send_btn, cooldown_seconds_box],
     )
 
     clear_btn.click(fn=None, inputs=None, outputs=[session_id_box], js=NEW_SESSION_JS)

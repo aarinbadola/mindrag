@@ -69,6 +69,26 @@ def _load_prompt(filename: str) -> str:
         return f.read()
 
 
+_DOCUMENT_TITLES_PATH = os.path.join(os.path.dirname(__file__), "document_titles.json")
+
+
+def _load_document_titles() -> dict:
+    if not os.path.isfile(_DOCUMENT_TITLES_PATH):
+        return {}
+    with open(_DOCUMENT_TITLES_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+_DOCUMENT_TITLES = _load_document_titles()
+
+
+def get_document_title(filename: str) -> str:
+    """Display-only complete title for a registered filename — falls back to the
+    filename (minus extension) for any document not in document_titles.json,
+    e.g. one added after the mapping was last regenerated."""
+    return _DOCUMENT_TITLES.get(filename, os.path.splitext(filename)[0])
+
+
 IMAGE_DESCRIPTION_PROMPT = _load_prompt("image_description.md")
 RESOLVE_DOCUMENTS_PROMPT = _load_prompt("resolve_documents.md")
 REWRITE_PROMPT = _load_prompt("rewrite.md")
@@ -79,6 +99,15 @@ RECAP_PROMPT = _load_prompt("recap.md")
 DIFF_PROMPT = _load_prompt("diff.md")
 
 FALLBACK_MESSAGE = "I couldn't find relevant information in the uploaded documents to answer this question."
+
+QA_FALLBACK_MESSAGE = (
+    "I couldn't find relevant information in the uploaded documents to answer this question.\n\n"
+    "A couple of things that might help:\n"
+    "- Adding more detail or context to your question.\n"
+    "- Mentioning a specific document by name — it won't filter the search to just that "
+    "document, but it does help match the right passages.\n\n"
+    "Or use one of the options below."
+)
 
 
 def _extract_json(text: str):
@@ -487,7 +516,7 @@ def check_and_rewrite(raw_query: str, session_id: str) -> dict:
 # Query pipeline — intent classification
 # ---------------------------------------------------------------------------
 
-_VALID_INTENTS = {"qa", "summarization", "diff", "recap"}
+_VALID_INTENTS = {"qa", "summarization", "diff", "recap", "meta"}
 
 
 def classify_intent(final_query: str) -> str:
@@ -547,7 +576,7 @@ def handle_qa(final_query: str, session_id: str) -> dict:
             candidates.append({"text": text, **metadata, "confidence": confidence})
 
     if not candidates:
-        return {"answer": FALLBACK_MESSAGE, "sources": [], "chunks_used": 0}
+        return {"answer": QA_FALLBACK_MESSAGE, "sources": [], "chunks_used": 0, "is_fallback": True}
 
     pairs = [(final_query, c["text"]) for c in candidates]
     scores = reranker_model.predict(pairs)
@@ -557,7 +586,7 @@ def handle_qa(final_query: str, session_id: str) -> dict:
     survivors = [c for c in candidates if c["reranker_score"] > config.RERANKER_SCORE_THRESHOLD]
 
     if not survivors:
-        return {"answer": FALLBACK_MESSAGE, "sources": [], "chunks_used": 0}
+        return {"answer": QA_FALLBACK_MESSAGE, "sources": [], "chunks_used": 0, "is_fallback": True}
 
     survivors.sort(key=lambda c: c["reranker_score"], reverse=True)
     selected = survivors[:top_k]
@@ -636,7 +665,7 @@ def _resolve_documents_llm(query: str, registered_filenames: list[str]) -> list[
     matching registered filenames (possibly empty — "no document referenced"),
     or None if the call/parse failed or returned nothing matchable (caller
     falls back to pure embedding resolution)."""
-    titles = [os.path.splitext(f)[0] for f in registered_filenames]
+    titles = [get_document_title(f) for f in registered_filenames]
     title_to_filename = dict(zip(titles, registered_filenames))
     doc_list = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
     user_content = f"DOCUMENT LIST:\n{doc_list}\n\nQUERY: {query}"
@@ -831,6 +860,140 @@ def handle_summarization(final_query: str, session_id: str, resolution: dict) ->
         "chunks_used": chunks_used_total,
         "documents_used": documents_used,
     }
+
+
+_overview_cache = {"filenames": None, "content": None}
+
+
+def get_documents_overview() -> str:
+    """Cached 'summarize everything' answer for the recovery popup's 'Get an
+    overview' button — identical on every request since it isn't tied to a
+    specific user question and the knowledge base only changes at startup, so
+    it's generated once (real Groq call, may raise RateLimitedError) and
+    reused until the registered document set changes."""
+    registered = database.get_registered_documents()
+    if _overview_cache["filenames"] == registered:
+        return _overview_cache["content"]
+
+    result = handle_summarization(
+        "Give me a general overview of these documents.",
+        session_id=None,
+        resolution={"type": "none"},
+    )
+    _overview_cache["content"] = result["answer"]
+    _overview_cache["filenames"] = list(registered)
+    return _overview_cache["content"]
+
+
+# ---------------------------------------------------------------------------
+# Onboarding — domain-hint generation
+# ---------------------------------------------------------------------------
+
+_DOMAIN_HINT_PROMPT = (
+    "You are summarizing the subject domain of a document collection for a chat "
+    "assistant's onboarding message. Given summaries of one or more documents (or "
+    "partial domain descriptions from earlier batches), respond with ONE short "
+    'sentence (max ~20 words) describing the overall subject domain(s) covered — '
+    'e.g. "machine learning research, healthcare AI, and human-robot interaction". '
+    "No preamble, no markdown, just the sentence."
+)
+
+_domain_hint_cache = {"filenames": None, "hint": None}
+
+
+def get_domain_hint(registered_filenames: list[str]) -> str:
+    """One-time Groq call summarizing the corpus's subject domain, cached and
+    regenerated only when the registered document set changes — same
+    invalidation trigger as _get_title_embeddings. Used by the shared
+    onboarding content (Step 5); never blocks startup on failure."""
+    if _domain_hint_cache["filenames"] == registered_filenames:
+        return _domain_hint_cache["hint"]
+
+    content_blocks = []
+    for filename in registered_filenames:
+        summary = database.get_document_summary(filename)
+        if summary:
+            content_blocks.append(f"## {get_document_title(filename)}\n{summary}")
+
+    hint = ""
+    if content_blocks:
+        try:
+            hint = _answer_from_documents(
+                content_blocks,
+                "In one short sentence (max ~20 words), describe the overall "
+                "subject domain(s) this collection of documents covers.",
+                prompt=_DOMAIN_HINT_PROMPT,
+            )
+        except Exception as exc:
+            logger.error("Domain-hint generation failed: %s", exc)
+            hint = ""
+
+    _domain_hint_cache["hint"] = hint
+    _domain_hint_cache["filenames"] = list(registered_filenames)
+    return hint
+
+
+# ---------------------------------------------------------------------------
+# Onboarding — shared capabilities + example-queries content
+# ---------------------------------------------------------------------------
+
+_onboarding_content_cache = {"filenames": None, "content": None}
+
+
+def _build_example_queries(registered_filenames: list[str]) -> dict:
+    """One grounded example query per intent, built from real registered
+    document titles rather than generic placeholders."""
+    if not registered_filenames:
+        return {}
+    titles = [get_document_title(f) for f in registered_filenames]
+    diff_b = titles[1] if len(titles) > 1 else titles[0]
+    return {
+        "qa": f'"What are the key findings in {titles[0]}?"',
+        "summarization": f'"Summarize {titles[0]}"',
+        "diff": f'"Compare {titles[0]} and {diff_b}"',
+        "recap": '"What have we discussed so far?"',
+    }
+
+
+def _build_onboarding_content(registered_filenames: list[str]) -> str:
+    examples = _build_example_queries(registered_filenames)
+    domain_hint = get_domain_hint(registered_filenames)
+
+    lines = ["**What I can help with:**"]
+    lines.append("- Answer questions about the documents (Document QA)")
+    lines.append("- Summarize one or more documents (Summarization)")
+    lines.append("- Compare two or more documents (Diff/Comparison)")
+    lines.append("- Recap our conversation so far (Conversation Recap)")
+
+    if domain_hint:
+        lines.append(f"\nThis knowledge base covers: {domain_hint}")
+
+    if examples:
+        lines.append("\n**Example queries:**")
+        lines.append(f"- {examples['qa']}")
+        lines.append(f"- {examples['summarization']}")
+        lines.append(f"- {examples['diff']}")
+        lines.append(f"- {examples['recap']}")
+
+    return "\n".join(lines)
+
+
+def get_onboarding_content(registered_filenames: list[str]) -> str:
+    """Shared capabilities + example-queries + domain-hint content, built once
+    and cached — reused by the permanent chat header block (app.py), the
+    meta-intent handler, and the recovery popup's 'show me what I can ask'
+    button. Regenerated only when the registered document set changes."""
+    if _onboarding_content_cache["filenames"] != registered_filenames:
+        _onboarding_content_cache["content"] = _build_onboarding_content(registered_filenames)
+        _onboarding_content_cache["filenames"] = list(registered_filenames)
+    return _onboarding_content_cache["content"]
+
+
+def handle_meta() -> dict:
+    """Capability/onboarding queries ('what can I ask?') — zero additional
+    LLM call, just returns the shared onboarding content."""
+    answer = get_onboarding_content(database.get_registered_documents())
+    return {"answer": answer, "sources": [], "chunks_used": 0}
 
 
 # ---------------------------------------------------------------------------
