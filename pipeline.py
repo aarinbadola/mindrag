@@ -516,7 +516,7 @@ def check_and_rewrite(raw_query: str, session_id: str) -> dict:
 # Query pipeline — intent classification
 # ---------------------------------------------------------------------------
 
-_VALID_INTENTS = {"qa", "summarization", "diff", "recap", "meta"}
+_VALID_INTENTS = {"qa", "summarization", "diff", "recap", "meta", "smalltalk"}
 
 
 def classify_intent(final_query: str) -> str:
@@ -1010,6 +1010,20 @@ def handle_meta() -> dict:
     LLM call, just returns the shared onboarding content."""
     answer = get_onboarding_content(database.get_registered_documents())
     return {"answer": answer, "sources": [], "chunks_used": 0}
+
+
+SMALLTALK_REPLY = (
+    "Hi there! I'm here to help with the documents — ask me a question, "
+    "request a summary or comparison, or ask for a recap of our chat "
+    'whenever you\'re ready. Type "what can I ask?" if you\'d like a few examples.'
+)
+
+
+def handle_smalltalk() -> dict:
+    """Pure greetings/thanks/chit-chat with no actionable request — zero LLM
+    call, a fixed friendly reply distinct from the fuller onboarding content
+    (that's reserved for an explicit 'meta' capability question)."""
+    return {"answer": SMALLTALK_REPLY, "sources": [], "chunks_used": 0}
 
 
 # ---------------------------------------------------------------------------

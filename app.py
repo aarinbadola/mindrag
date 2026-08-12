@@ -207,6 +207,8 @@ def _run_query(raw_query, final_query, was_rewritten, history, session_id, inten
         result = pipeline.handle_diff(final_query, session_id, resolution)
     elif intent == "meta":
         result = pipeline.handle_meta()
+    elif intent == "smalltalk":
+        result = pipeline.handle_smalltalk()
     else:
         result = pipeline.handle_qa(final_query, session_id)
 
