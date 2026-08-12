@@ -33,13 +33,11 @@ _ONBOARDING_CONTENT = pipeline.get_onboarding_content(_registered_docs)
 
 SESSION_JS = """
 () => {
-    console.log('[MindRAG DEBUG] SESSION_JS running');
     let id = sessionStorage.getItem('mindrag_session_id');
     if (!id) {
         id = crypto.randomUUID();
         sessionStorage.setItem('mindrag_session_id', id);
     }
-    console.log('[MindRAG DEBUG] SESSION_JS returning id:', id);
     return id;
 }
 """
@@ -165,7 +163,6 @@ def _rate_limit_updates(retry_after: int):
 
 
 def rehydrate_session(session_id):
-    print(f"[DEBUG] rehydrate_session called with session_id={session_id!r}", flush=True)
     if not session_id:
         # session_id should always be set by the JS load step; if it somehow isn't,
         # leave the input disabled rather than allow queries with no session to log against.
