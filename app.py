@@ -25,6 +25,12 @@ _doc_list_md = (
 )
 _doc_count_text = f"{len(_registered_docs)} documents loaded"
 
+# Built once, synchronously, before demo.launch() — same pattern as ingestion
+# itself. This content only changes if the registered document set changes,
+# which only happens during startup()'s diff-check, never mid-session, so
+# there's no reason to recompute it lazily per session.
+_ONBOARDING_CONTENT = pipeline.get_onboarding_content(_registered_docs)
+
 SESSION_JS = """
 () => {
     console.log('[MindRAG DEBUG] SESSION_JS running');
@@ -114,11 +120,18 @@ def _format_usage_metric(intent, chunks_used, sources):
 
 def _onboarding_entry():
     """Permanent first chat entry — capabilities + example queries + domain
-    hint, styled as a markdown blockquote so it reads as system content
-    rather than a normal message, without needing custom CSS."""
-    content = pipeline.get_onboarding_content(database.get_registered_documents())
-    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in content.split("\n"))
-    return [None, quoted]
+    hint. Styled with an explicit inline-CSS border/background rather than a
+    plain markdown blockquote — Gradio's default blockquote border color
+    (`--border-color-primary`) turned out to blend into the dark theme's
+    background, so it needs a color that's visible independent of theme."""
+    styled = (
+        '<div style="border-left: 4px solid #818cf8; '
+        "background: rgba(129, 140, 248, 0.12); "
+        'padding: 12px 16px; border-radius: 6px;">\n\n'
+        f"{_ONBOARDING_CONTENT}\n\n"
+        "</div>"
+    )
+    return [None, styled]
 
 
 def _messages_to_chatbot_history(messages):
@@ -177,7 +190,9 @@ def _classify_and_maybe_resolve(final_query):
     intent = pipeline.classify_intent(final_query)
     resolution = None
     if intent in ("summarization", "diff"):
-        resolution = pipeline._resolve_documents(final_query, database.get_registered_documents())
+        resolution = pipeline._resolve_documents(
+            final_query, database.get_registered_documents(), require_conjunction=(intent != "diff")
+        )
     return intent, resolution
 
 
@@ -367,9 +382,8 @@ def use_original(raw_query, history, session_id):
 
 def recovery_show_capabilities(history):
     """'Show me what I can ask' — zero LLM call, just renders the shared
-    onboarding content as a new chat entry."""
-    content = pipeline.get_onboarding_content(database.get_registered_documents())
-    updated_history = history + [[None, content]]
+    onboarding content (built once at startup) as a new chat entry."""
+    updated_history = history + [[None, _ONBOARDING_CONTENT]]
     return updated_history, gr.update(visible=False), gr.update(), gr.update(), gr.update()
 
 

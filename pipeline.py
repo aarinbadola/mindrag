@@ -637,7 +637,9 @@ def _get_title_embeddings(registered_filenames: list[str]):
     return _title_embedding_cache["embeddings"]
 
 
-def _resolve_documents_embedding_only(query: str, registered_filenames: list[str], scored: list) -> dict:
+def _resolve_documents_embedding_only(
+    query: str, registered_filenames: list[str], scored: list, require_conjunction: bool = True
+) -> dict:
     """Pure embedding+keyword resolution — used as the fallback when the LLM
     resolver call fails/is unparseable. `scored` is the pre-computed
     (filename, cosine_score) list, sorted descending."""
@@ -649,7 +651,7 @@ def _resolve_documents_embedding_only(query: str, registered_filenames: list[str
     query_lower = query.lower()
     has_conjunction = any(kw in query_lower for kw in config.MULTI_DOCUMENT_KEYWORDS)
 
-    if has_conjunction and len(above_floor) >= 2:
+    if len(above_floor) >= 2 and (has_conjunction or not require_conjunction):
         return {"type": "multi", "filenames": above_floor[: config.MAX_MULTI_DOCUMENTS]}
 
     second_score = scored[1][1] if len(scored) > 1 else 0.0
@@ -686,16 +688,27 @@ def _resolve_documents_llm(query: str, registered_filenames: list[str]) -> list[
     return resolved
 
 
-def _resolve_documents(query: str, registered_filenames: list[str]) -> dict:
-    """Resolves which document(s), if any, a summarization query refers to.
-    Hybrid: an LLM call (grounded in the actual titles) identifies WHICH
-    document(s) are referenced — it handles arbitrary phrasing ("differ from",
-    a bare comma list, etc.) that keyword gating misses. Embedding cosine
-    similarity supplies a calibrated ambiguity check for the single-document
-    case — the LLM tends to confidently pick one document even when several
-    are genuinely plausible, where an explicit numeric margin correctly flags
+def _resolve_documents(query: str, registered_filenames: list[str], require_conjunction: bool = True) -> dict:
+    """Resolves which document(s), if any, a query refers to. Hybrid: an LLM
+    call (grounded in the actual titles) identifies WHICH document(s) are
+    referenced — it handles arbitrary phrasing ("differ from", a bare comma
+    list, etc.) that keyword gating misses. Embedding cosine similarity
+    supplies a calibrated ambiguity check for the single-document case — the
+    LLM tends to confidently pick one document even when several are
+    genuinely plausible, where an explicit numeric margin correctly flags
     that as uncertain. Falls back to pure embedding+keyword resolution if the
-    LLM call fails. Returns one of:
+    LLM call fails.
+
+    `require_conjunction` gates whether 2+ LLM-identified documents count as
+    a genuine multi-document request (needs "and"/"compare"/etc. in the
+    query) or just ambiguity between candidates for a singular request (e.g.
+    "the deep learning paper" when two documents plausibly match). Callers
+    for `diff` intent should pass False — classify_intent() already requires
+    diff queries to reference 2+ documents, so the gate would only risk
+    false "ambiguous" results for phrasings like "how does X differ from Y"
+    that don't contain a listed keyword.
+
+    Returns one of:
       {"type": "none"}                          — no document referenced
       {"type": "single", "filename": ...}       — one confident match
       {"type": "multi", "filenames": [...]}     — multiple confident matches
@@ -712,13 +725,16 @@ def _resolve_documents(query: str, registered_filenames: list[str]) -> dict:
 
     llm_docs = _resolve_documents_llm(query, registered_filenames)
     if llm_docs is None:
-        return _resolve_documents_embedding_only(query, registered_filenames, scored)
+        return _resolve_documents_embedding_only(query, registered_filenames, scored, require_conjunction)
 
     if len(llm_docs) == 0:
         return {"type": "none"}
 
     if len(llm_docs) >= 2:
-        return {"type": "multi", "filenames": llm_docs[: config.MAX_MULTI_DOCUMENTS]}
+        has_conjunction = any(kw in query.lower() for kw in config.MULTI_DOCUMENT_KEYWORDS)
+        if has_conjunction or not require_conjunction:
+            return {"type": "multi", "filenames": llm_docs[: config.MAX_MULTI_DOCUMENTS]}
+        return {"type": "ambiguous", "candidates": llm_docs[: config.MAX_MULTI_DOCUMENTS]}
 
     chosen = llm_docs[0]
     chosen_score = score_by_filename.get(chosen, 0.0)
@@ -1061,7 +1077,15 @@ def handle_diff(final_query: str, session_id: str, resolution: dict) -> dict:
 def handle_recap(session_id: str) -> dict:
     messages = database.get_all_messages(session_id)
     if not messages:
-        return {"answer": "There is no conversation history yet to recap.", "sources": [], "chunks_used": 0}
+        return {
+            "answer": (
+                "It looks like we haven't chatted yet, so there's nothing to recap. "
+                "Ask me something about the documents first, and I'll be able to "
+                "summarize our conversation from there."
+            ),
+            "sources": [],
+            "chunks_used": 0,
+        }
 
     history_text = _format_history(messages)
     try:
