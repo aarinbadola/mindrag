@@ -312,8 +312,22 @@ def _extract_page_images(doc, page_number: int) -> list[str]:
         height = base_image.get("height", 0)
         if width < config.MIN_IMAGE_WIDTH or height < config.MIN_IMAGE_HEIGHT:
             continue
-        mime_type = f"image/{base_image.get('ext', 'png')}"
-        description = _describe_image(base_image["image"], mime_type)
+
+        # doc.extract_image() pulls the raw embedded stream, which can come back
+        # corrupted (valid-but-garbled pixels) for some colorspace/mask encodings.
+        # Rendering the page region instead goes through the same compositing a
+        # PDF viewer uses, so it's authoritative. extract_image() is still used
+        # above for its (reliable) width/height metadata.
+        rects = page.get_image_rects(xref)
+        if rects:
+            pixmap = page.get_pixmap(dpi=200, clip=rects[0])
+            image_bytes = pixmap.tobytes("png")
+            mime_type = "image/png"
+        else:
+            image_bytes = base_image["image"]
+            mime_type = f"image/{base_image.get('ext', 'png')}"
+
+        description = _describe_image(image_bytes, mime_type)
         if description:
             descriptions.append(description)
     return descriptions
